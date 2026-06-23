@@ -6,7 +6,7 @@ from datetime import datetime
 import sheets
 
 
-sheets.start_background_flush()
+
 from scraper import scrape_single_url
 
 MAX_RUNTIME_SECONDS = (5 * 60 * 60) + (50 * 60)  # 5h50m

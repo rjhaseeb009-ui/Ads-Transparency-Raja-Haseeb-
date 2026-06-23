@@ -29,6 +29,22 @@ CLAIM_TIME_COL = 10
 CLAIM_TOKEN_COL = 11
 CLAIM_STATUS_COL = 12
 CLAIM_TTL_MINUTES = 5
+# --------------------------
+# Logs disabled
+# --------------------------
+WRITE_LOGS = False
+
+def flush_logs():
+    """Logs disabled - do nothing"""
+    global LOG_CACHE
+    LOG_CACHE = []
+    return
+
+
+def add_log(row_number="", status="", log_type="", url="", video_id="", app_link="", message=""):
+    """Logs disabled - do nothing"""
+    return
+
 
 # ==========================
 # AUTH

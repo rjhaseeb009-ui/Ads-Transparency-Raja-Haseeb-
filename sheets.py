@@ -6,19 +6,15 @@ from datetime import datetime, timedelta
 import uuid
 
 # ==========================
-# CACHE CONFIG - OPTIMIZED FOR 2 AGENTS
+# CACHE CONFIG
 # ==========================
 SHEET_CACHE = None
 SHEET_CACHE_TIME = 0
-SHEET_CACHE_TTL = 60  # Increased from 60 (auth cache)
+SHEET_CACHE_TTL = 60
 
 SNAPSHOT_CACHE = None
 SNAPSHOT_TIME = 0
-SNAPSHOT_TTL = 45  # INCREASED from 10 - agents run slow enough to tolerate 45s delay
-
-# Rate limiting for writes
-LAST_WRITE_TIME = 0
-MIN_WRITE_INTERVAL = 1.0  # 1 second minimum between sheet writes
+SNAPSHOT_TTL = 10  # IMPORTANT: reduces API hits massively
 
 # ==========================
 # COLUMNS
@@ -58,21 +54,6 @@ def get_sheet():
     SHEET_CACHE = sheet
     SHEET_CACHE_TIME = now
     return sheet
-
-
-# ==========================
-# RATE LIMITING
-# ==========================
-def rate_limit_write():
-    """Enforce minimum interval between sheet writes to avoid quota hits"""
-    global LAST_WRITE_TIME
-    elapsed = time.time() - LAST_WRITE_TIME
-    if elapsed < MIN_WRITE_INTERVAL:
-        sleep_time = MIN_WRITE_INTERVAL - elapsed
-        time.sleep(sleep_time)
-    LAST_WRITE_TIME = time.time()
-
-
 # --------------------------
 # Logs disabled
 # --------------------------
@@ -95,7 +76,7 @@ def add_log(row_number="", status="", log_type="", url="", video_id="", app_link
 # ==========================
 def get_agent_rows_snapshot():
     """
-    ONE FULL READ ONLY (cached for 45 seconds to minimize API calls)
+    ONE FULL READ ONLY (cached for 10 seconds)
     """
     global SNAPSHOT_CACHE, SNAPSHOT_TIME
 
@@ -112,7 +93,7 @@ def get_agent_rows_snapshot():
         except gspread.exceptions.APIError as e:
             if "429" in str(e):
                 wait = 2 * (attempt + 1)
-                print(f"⚠ 429 hit on snapshot read, retrying in {wait}s")
+                print(f"⚠ 429 hit, retrying in {wait}s")
                 time.sleep(wait)
             else:
                 raise
@@ -167,7 +148,7 @@ def is_claim_expired(claim_time_text):
 
 
 # ==========================
-# CORE TASK PICKER (FIXED WITH WRITE RETRY + RATE LIMIT)
+# CORE TASK PICKER (FIXED)
 # ==========================
 def get_next_agent_task(direction, agent_name, run_id):
     direction = direction.lower().strip()
@@ -206,28 +187,14 @@ def get_next_agent_task(direction, agent_name, run_id):
         token = f"{agent_name}-{run_id}-{uuid.uuid4().hex[:10]}"
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # APPLY RATE LIMIT BEFORE WRITING
-        rate_limit_write()
+        # SINGLE WRITE ONLY (claim row)
+        sheet.update(
+            f"I{row_num}:L{row_num}",
+            [[agent_name, now, token, "CLAIMED"]]
+        )
 
-        # SINGLE WRITE ONLY (claim row) WITH RETRY LOGIC
-        for attempt in range(5):
-            try:
-                sheet.update(
-                    f"I{row_num}:L{row_num}",
-                    [[agent_name, now, token, "CLAIMED"]]
-                )
-                break  # Success - exit retry loop
-            except gspread.exceptions.APIError as e:
-                if "429" in str(e):
-                    wait = 2 * (attempt + 1)
-                    print(f"⚠ 429 hit on claim write, retrying in {wait}s")
-                    time.sleep(wait)
-                else:
-                    raise
-        else:
-            # Failed after all retries - skip this row and try next
-            print(f"❌ Failed to claim row {row_num} after retries")
-            continue
+        # ❌ REMOVED: confirm read (major quota fix)
+        # We trust write success instead of re-reading sheet
 
         return row_num, c["url"]
 
@@ -235,104 +202,33 @@ def get_next_agent_task(direction, agent_name, run_id):
 
 
 # ==========================
-# BATCH UPDATE (COMBINED WRITES)
-# ==========================
-def update_row_batch(row_num, combined_data=None, headline=None, description=None, status=None):
-    """
-    Batches multiple updates into a single API call to reduce quota usage.
-    
-    Args:
-        row_num: Row number to update
-        combined_data: List for columns A-G (combined row)
-        headline: Value for column M
-        description: Value for column N
-        status: Value for column L (CLAIM_STATUS_COL)
-    """
-    sheet = get_sheet()
-    
-    # Build batch update requests
-    updates = []
-    
-    if combined_data:
-        updates.append({
-            'range': f"A{row_num}:G{row_num}",
-            'values': [combined_data]
-        })
-    
-    if headline is not None or description is not None:
-        headline_val = headline if headline is not None else ""
-        description_val = description if description is not None else ""
-        updates.append({
-            'range': f"M{row_num}:N{row_num}",
-            'values': [[headline_val, description_val]]
-        })
-    
-    if status:
-        updates.append({
-            'range': f"L{row_num}",
-            'values': [[status]]
-        })
-    
-    if not updates:
-        return
-    
-    # Rate limit before batch write
-    rate_limit_write()
-    
-    # Execute batch update with retry
-    for attempt in range(3):
-        try:
-            if len(updates) == 1:
-                # Single update
-                u = updates[0]
-                sheet.update(u['range'], u['values'])
-            else:
-                # Use batch_update for multiple ranges
-                sheet.batch_update(updates)
-            return
-        except gspread.exceptions.APIError as e:
-            if "429" in str(e) and attempt < 2:
-                wait = 2 * (attempt + 1)
-                print(f"⚠ 429 hit on batch update, retrying in {wait}s")
-                time.sleep(wait)
-            else:
-                print(f"❌ Batch update failed: {e}")
-                return
-
-
-# ==========================
-# SIMPLE STATUS UPDATE WITH RETRY
+# SIMPLE STATUS UPDATE
 # ==========================
 def mark_agent_done(row_num, agent_name=None):
-    """Mark a row as DONE"""
-    rate_limit_write()
-    
     sheet = get_sheet()
-    for attempt in range(3):
-        try:
-            sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE")
-            return
-        except gspread.exceptions.APIError as e:
-            if "429" in str(e) and attempt < 2:
-                wait = 2 * (attempt + 1)
-                print(f"⚠ 429 hit on mark_done, retrying in {wait}s")
-                time.sleep(wait)
-            else:
-                print(f"❌ Failed to mark row {row_num} as DONE: {e}")
-                return
+    try:
+        sheet.update_cell(row_num, CLAIM_STATUS_COL, "DONE")
+    except:
+        pass
 
 
 # ==========================
-# LEGACY BULK UPDATE HELPERS (use update_row_batch instead)
+# BULK UPDATE HELPERS
 # ==========================
 def update_combined_row(row_index, data):
-    """LEGACY: Use update_row_batch() instead"""
-    update_row_batch(row_index, combined_data=data)
+    sheet = get_sheet()
+    try:
+        sheet.update(f"A{row_index}:G{row_index}", [data])
+    except Exception as e:
+        print(f"Update error: {e}")
 
 
 def update_headline_and_description(row_index, headline, description):
-    """LEGACY: Use update_row_batch() instead"""
-    update_row_batch(row_index, headline=headline, description=description)
+    sheet = get_sheet()
+    try:
+        sheet.update(f"M{row_index}:N{row_index}", [[headline, description]])
+    except Exception as e:
+        print(f"Update error: {e}")
 
 
 # ==========================
@@ -349,10 +245,3 @@ def get_urls_with_retry():
 def count_unprocessed_rows():
     rows = get_agent_rows_snapshot()
     return sum(1 for r in rows if r["url"] and not r["processed"])
-
-
-def invalidate_snapshot():
-    """Force snapshot cache to refresh on next call (use sparingly)"""
-    global SNAPSHOT_CACHE, SNAPSHOT_TIME
-    SNAPSHOT_CACHE = None
-    SNAPSHOT_TIME = 0
